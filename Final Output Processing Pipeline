@@ -1,0 +1,252 @@
+# libraries required for threading
+import logging
+import threading
+import time
+import sys
+import tty
+import termios
+import select
+
+# libraries required for audio output generation
+from playsound import playsound
+import gtts
+
+# define parameters 
+file_path = 'typescript'  # path to your text file
+labels = ['person', 'bicycle', 'car'] # labels for model
+focal_len = 36 # focal length of camera 
+
+# remember to always check and adjust this 
+actual_width = 640
+actual_height = 480
+curr_position = 0
+
+def categorize_region(xmin, ymin, xmax, ymax): 
+    center_x = (xmin + xmax) / 2
+    center_y = (ymin + ymax) / 2
+
+    if center_x < actual_width / 3:
+        region_x = "left"
+    elif center_x < 2 * actual_width / 3:
+        region_x = "center"
+    else:
+        region_x = "right"
+
+    if center_y < actual_height / 3:
+        region_y = "top"
+    elif center_y < 2 * actual_height / 3:
+        region_y = "middle"
+    else:
+        region_y = "bottom"
+
+    return f"{region_y}-{region_x}"
+
+# using height dimensions 
+def calculate_distance(xmin, ymin, xmax, ymax): 
+    dist_height = ymax - ymin 
+    return 1800*focal_len/dist_height # returns distance in mm 
+
+def parse_log_line(line):
+    # Check if the line contains the "RESULT" tag
+    if "RESULT" in line:
+        # Extract the next 6 numbers after "RESULT:"
+        result_values = [float(value) for value in line.split()[5:]]
+        return tuple(result_values)
+    return None
+
+# generates concise summary of surrounding cars
+def generate_output(left_side, right_side, centre):
+    if left_side == 0 and right_side == 0 and centre == 0:
+        return "There are no cars near you."
+    elif left_side > 0 and right_side == 0 and centre == 0:
+        return f"There is {left_side} car to your left." if left_side == 1 else f"There are {left_side} cars to your left."
+    elif left_side == 0 and right_side > 0 and centre == 0:
+        return f"There is {right_side} car to your right." if right_side == 1 else f"There are {right_side} cars to your right."
+    elif left_side == 0 and right_side == 0 and centre > 0:
+        return f"There is {centre} car in front of you." if centre == 1 else f"There are {centre} cars in front of you."
+    else:
+        left_text = f"{left_side} car to your left" if left_side == 1 else f"{left_side} cars to your left"
+        right_text = f"{right_side} car to your right" if right_side == 1 else f"{right_side} cars to your right"
+        centre_text = f"{centre} car in front of you" if centre == 1 else f"{centre} cars in front of you"
+        return f"There are {left_text}, {right_text}, and {centre_text}."
+
+    
+def process_log_file(file_path, left_side, right_side, centre, far, near):
+    tl_for_audio = ""
+    cars_for_audio = ""
+    curr_tl_status = ""
+ 
+    with open(file_path, 'r') as file:
+        new_lines = file.readlines()
+        detections = set()
+        
+        for line in new_lines: 
+            parsed_result = parse_log_line(line)
+            if parsed_result is not None and len(parsed_result) == 6 and parsed_result[5] > 0.5:
+                region = categorize_region(parsed_result[1], parsed_result[2], parsed_result[3], parsed_result[4])
+                
+                if parsed_result[0] == 2: # if car detected
+                    # using bounding box 
+                    area = (parsed_result[3]-parsed_result[1])*(parsed_result[4]-parsed_result[2])
+                    percent = (area/(actual_width*actual_height))*100
+                    # if percent > 0.0326 and percent < 10: 
+                    if percent > 0.0326 and percent < 20: 
+                        distance = 'far away'
+                    else: 
+                        distance = 'very close'
+                        	
+                    result = f"{labels[int(parsed_result[0])]} detected {distance}, in {region} region."
+                    if result not in detections: 
+                        detections.add(result)
+                        if 'close' in distance:
+                            near = near + 1
+                            if 'left' in region:
+                                left_side = left_side + 1
+                            elif 'right' in region:
+                                right_side = right_side + 1
+                            elif 'center' in region:
+                                centre = centre + 1
+                        elif 'far' in distance:
+                            far = far + 1
+                        
+                        print(result)
+                    
+                elif parsed_result[0] == 4: # green traffic light
+                    result = "traffic light is green, you may start crossing."
+                    
+                    tl_for_audio = "Traffic light is green, you can go." # added this in
+                    curr_tl_status = "GREEN"
+                    
+                    if result not in detections: 
+                        detections.add(result)
+                        print(result)
+                elif parsed_result[0] == 5: # red traffic light 
+                    result = "traffic light is red, do not start crossing."
+                    
+                    tl_for_audio = "Traffic light is red, stop." # added this in
+                    curr_tl_status = "RED"
+                    
+                    if result not in detections: 
+                        detections.add(result)
+                        print(result)
+        
+        # added this section in
+        if near == 0:
+            cars_for_audio = f"There are no cars near you. {far} cars far from you."
+        else:
+            cars_for_audio = generate_output(left_side, right_side, centre)
+        		
+        #print("end of process_log_file function.")
+        #curr_position = file.tell() 
+        return cars_for_audio, tl_for_audio, left_side, right_side, centre, far, near, curr_tl_status
+
+
+class TrafficLightThread(threading.Thread):
+# this thread is used to check for user keyboard inputs
+# if user input == 'u' (update), it will inform the main section to provide audio on the surrounding cars immediately.
+    def __init__(self):
+        super().__init__()
+        self._stop_event = threading.Event()
+        self.output = ""
+
+    def run(self):
+        while not self._stop_event.is_set():
+            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+            	# this 'if' statement checks if there's user input available
+                key = sys.stdin.read(1)
+                if key == 'u':
+                    self.output = "User pressed button."
+                else:
+                    self.output = ""
+            else:
+            	self.output = ""
+            time.sleep(0.1) # this is necessary for the code to work. Do not remove.
+
+    def stop(self):
+        self._stop_event.set()
+       
+    def get_output(self):
+    	return self.output
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s: %(message)s", datefmt="%H:%M:%S")
+
+    orig_settings = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin)
+
+    #logging.info("Main: creating traffic light thread")
+    traffic_light_thread = TrafficLightThread()
+    #logging.info("Main: starting traffic light thread")
+    traffic_light_thread.start()
+
+    prev_time_5 = time.time()
+    prev_time_1 = time.time()   # added this in for the 1 second printing counter
+
+    # added these in as part of debugging step 3
+    left_side = 0
+    right_side = 0
+    centre = 0
+    far = 0
+    near = 0
+
+    prev_tl_status = ""  # added this in for traffic light change detection
+    curr_tl_status = ""
+    
+    try:
+        while True:
+            # Main thread does other work while button checker runs
+            final_output_string = None
+            current_time = time.time()
+            output_s = traffic_light_thread.get_output()
+
+            if output_s: # if user pressed button,
+                button_s = output_s + cars_for_audio
+            elif output_s == "":
+                button_s = ""
+
+            time_diff = current_time - prev_time_5
+
+            # added this in
+            if (current_time - prev_time_1) >= 1:
+                # shifted the resetting of counters here, so it resets once per second
+                # reset the counters
+                left_side = 0
+                right_side = 0
+                centre = 0
+                far = 0
+                near = 0
+
+                prev_tl_status = curr_tl_status
+                cars_for_audio, tl_for_audio, left_side,right_side,centre,far,near, curr_tl_status=process_log_file(file_path, left_side, right_side, centre, far, near)
+                #print(curr_position)
+                prev_time_1 = current_time
+
+            if (time_diff >= 10) or (curr_tl_status != prev_tl_status):  #changed this
+                final_output_string = button_s + tl_for_audio
+                prev_time_5 = current_time
+            else:
+                final_output_string = button_s
+
+            # creating audio file
+            if final_output_string:
+                t1 = gtts.gTTS(final_output_string)
+                t1.save("final_audio.wav")
+                print("wav file created and saved")
+
+            if ((output_s != "") or (time_diff >= 10) or (curr_tl_status != prev_tl_status)) and (final_output_string): #changed this
+                logging.info(final_output_string)
+
+                # play audio output
+                playsound("final_audio.wav")
+
+            time.sleep(0.1) # to avoid high CPU usage in the loop
+
+    except KeyboardInterrupt:
+        logging.info("Main: received keyboard interrupt")
+        logging.info("Main: stopping traffic light thread")
+        traffic_light_thread.stop()
+        traffic_light_thread.join()
+
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, orig_settings)
